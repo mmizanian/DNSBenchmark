@@ -277,15 +277,27 @@ async def probe_dns_host(host: str, port: int, timeout: float) -> bool:
         return False
 
 
-async def scan_dns_targets(hosts: List[str], port: int, timeout: float) -> List[str]:
+async def scan_dns_targets(
+    hosts: List[str],
+    port: int,
+    timeout: float,
+    progress_callback: Optional[Any] = None,
+) -> List[str]:
     semaphore = asyncio.Semaphore(50)
     found: List[str] = []
+    progress_lock = asyncio.Lock()
+    completed = 0
 
     async def probe(host: str) -> None:
+        nonlocal completed
         async with semaphore:
             if await probe_dns_host(host, port, timeout):
                 found.append(host)
             await asyncio.sleep(0.01)
+        async with progress_lock:
+            completed += 1
+            if progress_callback is not None:
+                progress_callback(completed, len(hosts))
 
     tasks = [asyncio.create_task(probe(host)) for host in hosts]
     await asyncio.gather(*tasks)
@@ -364,87 +376,140 @@ async def run_speed_test(
     turbo_timeout_ms: int = 0,
     cancel_event: Optional[threading.Event] = None,
 ) -> Dict[str, Any]:
-    resolver = dns.asyncresolver.Resolver()
-    resolver.nameservers = [server.primary]
-    resolver.port = server.port
-    success_times: List[float] = []
-    total = len(domains) * queries_per_domain
-    query_timeout = timeout
-    if turbo_enabled and turbo_timeout_ms > 0:
-        query_timeout = min(timeout, turbo_timeout_ms / 1000.0)
+    async def benchmark_address(address: str) -> Dict[str, Any]:
+        resolver = dns.asyncresolver.Resolver()
+        resolver.nameservers = [address]
+        resolver.port = server.port
+        success_times: List[float] = []
+        total = len(domains) * queries_per_domain
+        query_timeout = timeout
+        if turbo_enabled and turbo_timeout_ms > 0:
+            query_timeout = min(timeout, turbo_timeout_ms / 1000.0)
 
-    for domain in domains:
-        if cancel_event is not None and cancel_event.is_set():
-            break
-        domain_had_slow = False
-        for i in range(queries_per_domain):
+        for domain in domains:
             if cancel_event is not None and cancel_event.is_set():
                 break
-            if i > 0:
-                await asyncio.sleep(0.01)
-            success, elapsed = await single_query(resolver, domain, query_timeout)
-            if success:
-                success_times.append(elapsed)
-            if turbo_enabled and turbo_timeout_ms > 0 and elapsed * 1000.0 >= turbo_timeout_ms:
-                domain_had_slow = True
+            domain_had_slow = False
+            for i in range(queries_per_domain):
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                if i > 0:
+                    await asyncio.sleep(0.01)
+                success, elapsed = await single_query(resolver, domain, query_timeout)
+                if success:
+                    success_times.append(elapsed)
+                if turbo_enabled and turbo_timeout_ms > 0 and elapsed * 1000.0 >= turbo_timeout_ms:
+                    domain_had_slow = True
+                    break
+            if domain_had_slow:
+                continue
+
+        success_rate = (len(success_times) / total * 100.0) if total > 0 else 0.0
+        stats = {
+            "success_count": len(success_times),
+            "total_queries": total,
+            "success_rate": round(success_rate, 2),
+            "success_times": success_times,
+        }
+        if success_times:
+            avg = statistics.mean(success_times) * 1000.0
+            min_ = min(success_times) * 1000.0
+            max_ = max(success_times) * 1000.0
+            std = statistics.stdev(success_times) * 1000.0 if len(success_times) > 1 else 0.0
+            stats.update({
+                "avg_ms": round(avg, 2),
+                "min_ms": round(min_, 2),
+                "max_ms": round(max_, 2),
+                "std_dev_ms": round(std, 2),
+            })
+        else:
+            stats.update({"avg_ms": 0.0, "min_ms": 0.0, "max_ms": 0.0, "std_dev_ms": 0.0})
+
+        hijacked = False
+        test_domain = f"nxdomain-check-{random.randint(100000,999999)}.example.com"
+        try:
+            answer = await resolver.resolve(test_domain, "A", lifetime=timeout)
+            if answer.rrset and len(answer.rrset) > 0:
+                hijacked = True
+        except dns.resolver.NXDOMAIN:
+            hijacked = False
+        except (dns.resolver.NoAnswer, dns.resolver.NoNameservers, dns.resolver.LifetimeTimeout):
+            hijacked = False
+        except Exception:
+            hijacked = False
+
+        suspicious_real_domain = False
+        suspect_ips: List[str] = []
+        real_domains = ["google.com", "microsoft.com", "github.com", "wikipedia.org"]
+        for domain in real_domains:
+            if cancel_event is not None and cancel_event.is_set():
                 break
-        if domain_had_slow:
-            continue
+            random_name = make_random_subdomain(domain)
+            resolved, ips, _, rcode = await query_a_records(resolver, random_name, timeout)
+            if resolved and ips and rcode == "NOERROR":
+                suspicious_real_domain = True
+                suspect_ips.extend(ips)
+                break
+            await asyncio.sleep(0.01)
 
-    success_rate = (len(success_times) / total * 100.0) if total > 0 else 0.0
-    stats = {
-        "success_count": len(success_times),
-        "total_queries": total,
-        "success_rate": round(success_rate, 2),
-    }
-    if success_times:
-        avg = statistics.mean(success_times) * 1000.0
-        min_ = min(success_times) * 1000.0
-        max_ = max(success_times) * 1000.0
-        std = statistics.stdev(success_times) * 1000.0 if len(success_times) > 1 else 0.0
-        stats.update({
-            "avg_ms": round(avg, 2),
-            "min_ms": round(min_, 2),
-            "max_ms": round(max_, 2),
-            "std_dev_ms": round(std, 2),
-        })
-    else:
-        stats.update({"avg_ms": 0.0, "min_ms": 0.0, "max_ms": 0.0, "std_dev_ms": 0.0})
-
-    hijacked = False
-    test_domain = f"nxdomain-check-{random.randint(100000,999999)}.example.com"
-    try:
-        answer = await resolver.resolve(test_domain, "A", lifetime=timeout)
-        if answer.rrset and len(answer.rrset) > 0:
+        if suspicious_real_domain:
             hijacked = True
-    except dns.resolver.NXDOMAIN:
-        hijacked = False
-    except (dns.resolver.NoAnswer, dns.resolver.NoNameservers, dns.resolver.LifetimeTimeout):
-        hijacked = False
-    except Exception:
-        hijacked = False
+            stats["hijack_reason"] = "random real-domain subdomain resolved"
+            stats["hijack_ips"] = suspect_ips
 
-    suspicious_real_domain = False
-    suspect_ips: List[str] = []
-    real_domains = ["google.com", "microsoft.com", "github.com", "wikipedia.org"]
-    for domain in real_domains:
-        if cancel_event is not None and cancel_event.is_set():
-            break
-        random_name = make_random_subdomain(domain)
-        resolved, ips, _, rcode = await query_a_records(resolver, random_name, timeout)
-        if resolved and ips and rcode == "NOERROR":
-            suspicious_real_domain = True
-            suspect_ips.extend(ips)
-            break
-        await asyncio.sleep(0.01)
+        stats["hijacked"] = hijacked
+        stats["score"] = round(-9999.0 if hijacked else (stats["success_rate"] * 10.0 - stats["avg_ms"] * 0.2 - stats["std_dev_ms"] * 0.1), 2)
+        return stats
 
-    if suspicious_real_domain:
-        hijacked = True
-        stats["hijack_reason"] = "random real-domain subdomain resolved"
-        stats["hijack_ips"] = suspect_ips
+    primary_stats = await benchmark_address(server.primary)
+    primary_times = list(primary_stats.get("success_times", []))
+    primary_stats.pop("success_times", None)
 
-    stats["hijacked"] = hijacked
-    stats["score"] = round(-9999.0 if hijacked else (stats["success_rate"] * 10.0 - stats["avg_ms"] * 0.2 - stats["std_dev_ms"] * 0.1), 2)
+    secondary_stats: Dict[str, Any] = {}
+    secondary_times: List[float] = []
+    if server.secondary:
+        secondary_stats = await benchmark_address(server.secondary)
+        secondary_times = list(secondary_stats.get("success_times", []))
+        secondary_stats.pop("success_times", None)
+
+    all_success_times = primary_times + secondary_times
+    combined_total = primary_stats.get("total_queries", 0) + secondary_stats.get("total_queries", 0)
+    combined_success = primary_stats.get("success_count", 0) + secondary_stats.get("success_count", 0)
+    combined_success_rate = (combined_success / combined_total * 100.0) if combined_total > 0 else 0.0
+    if all_success_times:
+        combined_avg = statistics.mean(all_success_times) * 1000.0
+        combined_min = min(all_success_times) * 1000.0
+        combined_max = max(all_success_times) * 1000.0
+        combined_std = statistics.stdev(all_success_times) * 1000.0 if len(all_success_times) > 1 else 0.0
+    else:
+        combined_avg = combined_min = combined_max = combined_std = 0.0
+
+    stats = {
+        "success_count": combined_success,
+        "total_queries": combined_total,
+        "success_rate": round(combined_success_rate, 2),
+        "avg_ms": round(combined_avg, 2),
+        "min_ms": round(combined_min, 2),
+        "max_ms": round(combined_max, 2),
+        "std_dev_ms": round(combined_std, 2),
+        "primary": primary_stats,
+        "secondary": secondary_stats,
+        "hijacked": primary_stats.get("hijacked", False) or secondary_stats.get("hijacked", False),
+        "score": round(
+            -9999.0
+            if (primary_stats.get("hijacked", False) or secondary_stats.get("hijacked", False))
+            else (combined_success_rate * 10.0 - combined_avg * 0.2 - combined_std * 0.1),
+            2,
+        ),
+    }
+    if primary_stats.get("hijack_reason"):
+        stats["hijack_reason"] = primary_stats["hijack_reason"]
+    if secondary_stats.get("hijack_reason"):
+        stats["hijack_reason"] = secondary_stats["hijack_reason"]
+    if primary_stats.get("hijack_ips"):
+        stats["hijack_ips"] = primary_stats["hijack_ips"]
+    if secondary_stats.get("hijack_ips"):
+        stats["hijack_ips"] = secondary_stats["hijack_ips"]
     return stats
 
 
@@ -666,7 +731,7 @@ class DNSBenchmarkApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("DNS Benchmark")
-        self.geometry("1120x720")
+        self.geometry("1200x760")
         self.config_obj = load_config()
         builtin = [DNSServer.from_dict(item) for item in self.config_obj["dns_servers"]]
         custom = [DNSServer.from_dict(item) for item in self.config_obj["custom_dns"]]
@@ -676,29 +741,38 @@ class DNSBenchmarkApp(tk.Tk):
         self.benchmark_results: Dict[str, Dict[str, Any]] = {}
         self.benchmark_thread: Optional[threading.Thread] = None
         self.benchmark_cancel_event = threading.Event()
+        self.discovered_scan_hosts: List[str] = []
         self.create_widgets()
         self.refresh_table()
 
     def create_widgets(self) -> None:
         self.title("MiziDNS")
-        self.geometry("980x640")
-        self.minsize(920, 560)
+        self.geometry("1200x760")
+        self.minsize(1100, 700)
+        self.configure(bg="#0a2118")
 
         style = ttk.Style(self)
         try:
             style.theme_use("clam")
         except Exception:
             style.theme_use("default")
-        style.configure("Title.TLabel", font=("Segoe UI", 16, "bold"))
-        style.configure("Header.TLabel", font=("Segoe UI", 10, "bold"))
-        style.configure("Section.TLabel", font=("Segoe UI", 9, "bold"))
-        style.configure("TLabel", font=("Segoe UI", 9))
-        style.configure("TButton", font=("Segoe UI", 9))
-        style.configure("TEntry", font=("Segoe UI", 9))
-        style.configure("Treeview", font=("Segoe UI", 9), rowheight=24)
-        style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
-        style.configure("TNotebook", background="#f1f1f1")
-        style.configure("TNotebook.Tab", font=("Segoe UI", 9, "bold"), padding=(8, 4))
+        style.configure("Title.TLabel", font=("Segoe UI", 16, "bold"), foreground="#f4fff7", background="#0a2118")
+        style.configure("Header.TLabel", font=("Segoe UI", 10, "bold"), foreground="#e6fff0", background="#0a2118")
+        style.configure("Section.TLabel", font=("Segoe UI", 9, "bold"), foreground="#e6fff0", background="#0a2118")
+        style.configure("TLabel", font=("Segoe UI", 9), foreground="#e6fff0", background="#0a2118")
+        style.configure("TButton", font=("Segoe UI", 9), foreground="#ffffff", background="#174b34")
+        style.configure("TEntry", font=("Segoe UI", 9), foreground="#f4fff7", fieldbackground="#123c2a")
+        style.configure("TFrame", background="#0a2118")
+        style.configure("TLabelFrame", background="#0a2118")
+        style.configure("TLabelframe.Label", foreground="#f4fff7", background="#0a2118")
+        style.configure("TCombobox", fieldbackground="#123c2a", foreground="#f4fff7")
+        style.configure("Treeview", font=("Segoe UI", 9), rowheight=24, background="#0d2a1d", fieldbackground="#0d2a1d", foreground="#f4fff7")
+        style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"), background="#123c2a", foreground="#f4fff7")
+        style.configure("TNotebook", background="#0a2118")
+        style.configure("TNotebook.Tab", font=("Segoe UI", 9, "bold"), padding=(8, 4), background="#123c2a", foreground="#e6fff0")
+        style.configure("Horizontal.TProgressbar", background="#1d6641", troughcolor="#0d2a1d")
+        style.map("TButton", background=[("active", "#1d6641"), ("!disabled", "#174b34")], foreground=[("!disabled", "#ffffff")])
+        style.map("Treeview", background=[("selected", "#1d6641")], foreground=[("selected", "#ffffff")])
 
         header_frame = ttk.Frame(self, padding=(12, 10, 12, 6))
         header_frame.pack(fill=tk.X)
@@ -713,8 +787,10 @@ class DNSBenchmarkApp(tk.Tk):
 
         control_tab = ttk.Frame(notebook)
         benchmark_tab = ttk.Frame(notebook)
+        scanner_tab = ttk.Frame(notebook)
         notebook.add(control_tab, text="DNS Control")
         notebook.add(benchmark_tab, text="Fastest DNS")
+        notebook.add(scanner_tab, text="DNS Scanner")
 
         main_frame = ttk.Frame(control_tab, padding=(10, 10))
         main_frame.pack(fill=tk.BOTH, expand=True)
@@ -816,6 +892,7 @@ class DNSBenchmarkApp(tk.Tk):
             "DNS 2",
             "Status",
             "Hijacked",
+            "Score",
             "Success %",
             "Avg ms",
             "Min ms",
@@ -830,6 +907,7 @@ class DNSBenchmarkApp(tk.Tk):
             "DNS 2": {"anchor": tk.W, "width": 120},
             "Status": {"anchor": tk.CENTER, "width": 90},
             "Hijacked": {"anchor": tk.CENTER, "width": 90},
+            "Score": {"anchor": tk.CENTER, "width": 80},
             "Success %": {"anchor": tk.CENTER, "width": 90},
             "Avg ms": {"anchor": tk.CENTER, "width": 90},
             "Min ms": {"anchor": tk.CENTER, "width": 90},
@@ -889,6 +967,45 @@ class DNSBenchmarkApp(tk.Tk):
         self.recommend_frame.pack(fill=tk.X, pady=(10, 0))
         self.recommend_frame.pack_forget()
 
+        scanner_frame = ttk.Frame(scanner_tab, padding=(12, 12))
+        scanner_frame.pack(fill=tk.BOTH, expand=True)
+        self.scan_status_var = tk.StringVar(value="Idle")
+        ttk.Label(scanner_frame, text="Scanner Status", style="Section.TLabel").pack(anchor=tk.W)
+        self.scan_status_label = ttk.Label(scanner_frame, textvariable=self.scan_status_var, foreground="#d7ffe8")
+        self.scan_status_label.pack(anchor=tk.W, pady=(4, 12))
+        self.scan_progress_bar = ttk.Progressbar(scanner_frame, maximum=100, mode="indeterminate")
+        self.scan_progress_bar.pack(fill=tk.X, pady=(0, 12))
+
+        summary_frame = ttk.LabelFrame(scanner_frame, text="Scan Summary", padding=(10, 10))
+        summary_frame.pack(fill=tk.X, pady=(0, 10))
+        self.scan_target_var = tk.StringVar(value="-")
+        self.scan_port_var = tk.StringVar(value="-")
+        self.scan_total_var = tk.StringVar(value="0")
+        self.scan_found_var = tk.StringVar(value="0")
+        self.scan_added_var = tk.StringVar(value="0")
+        ttk.Label(summary_frame, text="Target:").grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(summary_frame, textvariable=self.scan_target_var).grid(row=0, column=1, sticky=tk.W, padx=(8, 16))
+        ttk.Label(summary_frame, text="Port:").grid(row=0, column=2, sticky=tk.W)
+        ttk.Label(summary_frame, textvariable=self.scan_port_var).grid(row=0, column=3, sticky=tk.W, padx=(8, 16))
+        ttk.Label(summary_frame, text="Hosts checked:").grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
+        ttk.Label(summary_frame, textvariable=self.scan_total_var).grid(row=1, column=1, sticky=tk.W, padx=(8, 16), pady=(6, 0))
+        ttk.Label(summary_frame, text="Found:").grid(row=1, column=2, sticky=tk.W, pady=(6, 0))
+        ttk.Label(summary_frame, textvariable=self.scan_found_var).grid(row=1, column=3, sticky=tk.W, padx=(8, 16), pady=(6, 0))
+        ttk.Label(summary_frame, text="Added:").grid(row=2, column=0, sticky=tk.W, pady=(6, 0))
+        ttk.Label(summary_frame, textvariable=self.scan_added_var).grid(row=2, column=1, sticky=tk.W, padx=(8, 16), pady=(6, 0))
+
+        results_frame = ttk.Frame(scanner_frame)
+        results_frame.pack(fill=tk.BOTH, expand=True)
+        self.scan_log = tk.Text(results_frame, height=12, wrap=tk.WORD, bg="#0d2a1d", fg="#f4fff7", insertbackground="#f4fff7")
+        self.scan_log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
+        self.scan_log.insert(tk.END, "Scanner log ready.\n")
+        found_hosts_frame = ttk.LabelFrame(results_frame, text="Discovered Hosts", padding=(8, 8))
+        found_hosts_frame.pack(side=tk.RIGHT, fill=tk.Y)
+        self.scan_hosts_list = tk.Listbox(found_hosts_frame, width=30, height=12, bg="#0d2a1d", fg="#f4fff7", selectbackground="#1d6641")
+        self.scan_hosts_list.pack(fill=tk.BOTH, expand=True)
+        self.add_discovered_button = ttk.Button(scanner_frame, text="Add All Discovered DNS", command=self.on_add_discovered_dns)
+        self.add_discovered_button.pack(anchor=tk.W, pady=(10, 0))
+
         status_frame = ttk.Frame(self)
         status_frame.pack(fill=tk.X, padx=12, pady=(0, 10))
         self.progress_bar = ttk.Progressbar(status_frame, maximum=100, mode="determinate")
@@ -903,6 +1020,10 @@ class DNSBenchmarkApp(tk.Tk):
         self.update_dns_server_list()
         self.toggle_custom_dns()
         self.refresh_table()
+        self.update_idletasks()
+        required_width = max(self.winfo_reqwidth(), 1180)
+        required_height = max(self.winfo_reqheight(), 740)
+        self.geometry(f"{required_width}x{required_height}")
 
     def set_status(self, message: str) -> None:
         self.status_var.set(message)
@@ -1068,19 +1189,51 @@ class DNSBenchmarkApp(tk.Tk):
             return "Done"
         return "Idle"
 
-    def get_row_tags(self, res: Dict[str, Any]) -> List[str]:
-        return ["hijacked"] if res.get("hijacked") else []
+    def get_score_label(self, res: Optional[Dict[str, Any]]) -> str:
+        if not res:
+            return "-"
+        if res.get("hijacked"):
+            return "Unsafe"
+        try:
+            score = float(res.get("score", 0.0))
+        except (TypeError, ValueError):
+            score = 0.0
+        if score >= 80:
+            return "Strong"
+        if score >= 45:
+            return "Good"
+        if score >= 10:
+            return "Fair"
+        return "Avoid"
 
-    def format_row_values(self, server: DNSServer, res: Dict[str, Any], status: Optional[str] = None) -> Tuple[str, str, str, str, str, str, str, str, str, str]:
+    def get_row_tags(self, res: Dict[str, Any]) -> List[str]:
+        tags: List[str] = []
+        if res.get("hijacked"):
+            tags.append("hijacked")
+        else:
+            score_label = self.get_score_label(res)
+            if score_label in {"Strong", "Good"}:
+                tags.append("fast")
+            elif score_label == "Avoid":
+                tags.append("error")
+        return tags
+
+    def format_row_values(self, server: DNSServer, res: Dict[str, Any], status: Optional[str] = None) -> Tuple[str, str, str, str, str, str, str, str, str, str, str]:
         if status is None:
             status = self.get_status_for_result(res)
         hijacked_text = "Yes" if res.get("hijacked") else ("No" if res else "-")
+        score_text = self.get_score_label(res)
+        primary_stats = res.get("primary", {}) if res else {}
+        secondary_stats = res.get("secondary", {}) if res else {}
+        primary_label = f"{server.primary} ({primary_stats.get('success_rate', 0):.1f}% / {primary_stats.get('avg_ms', 0):.2f} ms)" if res else server.primary
+        secondary_label = f"{server.secondary} ({secondary_stats.get('success_rate', 0):.1f}% / {secondary_stats.get('avg_ms', 0):.2f} ms)" if server.secondary and res else (server.secondary or "-")
         return (
             server.name,
-            server.primary,
-            server.secondary or "-",
+            primary_label,
+            secondary_label,
             status,
             hijacked_text,
+            score_text,
             f"{res.get('success_rate', 0):.1f}%" if res else "-",
             f"{res.get('avg_ms', 0):.2f}" if res else "-",
             f"{res.get('min_ms', 0):.2f}" if res else "-",
@@ -1207,11 +1360,12 @@ class DNSBenchmarkApp(tk.Tk):
             return
         primary = winners[0].primary
         secondary = winners[0].secondary or (winners[1].primary if len(winners) > 1 else "")
+        best_score = self.benchmark_results[winners[0].id]
         self.primary_var.set(primary)
         self.secondary_var.set(secondary)
         self.custom_primary_var.set(primary)
         self.custom_secondary_var.set(secondary)
-        self.safe_var.set("Safe")
+        self.safe_var.set(self.get_score_label(best_score))
         self.recommend_frame.pack(fill=tk.X, padx=6, pady=(0, 6))
 
     def open_donate_link(self) -> None:
@@ -1367,19 +1521,77 @@ class DNSBenchmarkApp(tk.Tk):
         if result is None:
             return
         target_spec, port = result
+        self.discovered_scan_hosts = []
+        self.scan_log.delete("1.0", tk.END)
+        self.scan_hosts_list.delete(0, tk.END)
+        self.scan_target_var.set(target_spec)
+        self.scan_port_var.set(str(port))
+        self.scan_total_var.set("0")
+        self.scan_found_var.set("0")
+        self.scan_added_var.set("0")
+        self.scan_log.insert(tk.END, f"Starting scan for {target_spec}:{port}\n")
+        self.scan_status_var.set(f"Scanning {target_spec}:{port}...")
         self.set_status(f"Scanning {target_spec}:{port}...")
+        self.progress_bar.config(mode="indeterminate")
+        self.progress_bar.start(15)
+        self.scan_progress_bar.config(mode="indeterminate")
+        self.scan_progress_bar.start(15)
         scan_thread = threading.Thread(target=self.scan_worker, args=(target_spec, port), daemon=True)
         scan_thread.start()
+
+    def on_add_discovered_dns(self) -> None:
+        if not self.discovered_scan_hosts:
+            messagebox.showinfo("Add Discovered DNS", "Run a scan first to discover hosts.", parent=self)
+            return
+        custom = [DNSServer.from_dict(item) for item in self.config_obj["custom_dns"]]
+        existing_ips = {server.primary for server in custom} | {server.primary for server in [DNSServer.from_dict(item) for item in self.config_obj["dns_servers"]]}
+        new_entries: List[DNSServer] = []
+        for host in self.discovered_scan_hosts:
+            if host in existing_ips:
+                continue
+            new_server = DNSServer(f"discovered_{host.replace('.', '_')}_{int(time.time())}", f"Discovered DNS {host}", host, "", self.scan_port_var.get())
+            custom.append(new_server)
+            new_entries.append(new_server)
+            existing_ips.add(host)
+        self.config_obj["custom_dns"] = [server.to_dict() for server in custom]
+        save_config(self.config_obj)
+        self.all_servers = [DNSServer.from_dict(item) for item in self.config_obj["dns_servers"]] + custom
+        self.update_dns_server_list()
+        self.refresh_table(sort_results=True)
+        self.scan_added_var.set(str(len(new_entries)))
+        self.scan_log.insert(tk.END, f"Added {len(new_entries)} discovered DNS entries to the custom list.\n")
+        self.set_status(f"Added {len(new_entries)} discovered DNS entries.")
 
     def scan_worker(self, target_spec: str, port: int) -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
             hosts = parse_scan_targets(target_spec)
-            found_hosts = loop.run_until_complete(scan_dns_targets(hosts, port, self.config_obj.get("timeout", 2)))
+            self.after(0, self.scan_status_var.set, f"Scanning DNS hosts 0/{len(hosts)}...")
+            self.after(0, self.scan_total_var.set, str(len(hosts)))
+            self.after(0, self.scan_log.insert, tk.END, f"Preparing {len(hosts)} hosts to test.\n")
+            found_hosts: List[str] = []
+
+            def update_progress(done: int, total: int) -> None:
+                self.after(0, self.scan_status_var.set, f"Scanning DNS hosts {done}/{total}...")
+                self.after(0, self.scan_log.insert, tk.END, f"Probed {done}/{total} hosts\n")
+
+            found_hosts = loop.run_until_complete(
+                scan_dns_targets(
+                    hosts,
+                    port,
+                    self.config_obj.get("timeout", 2) / 1000.0,
+                    progress_callback=update_progress,
+                )
+            )
+            self.discovered_scan_hosts = found_hosts
             if not found_hosts:
                 self.after(0, lambda: messagebox.showwarning("Scan DNS", "No DNS services discovered.", parent=self))
                 self.after(0, lambda: self.set_status("No DNS services discovered."))
+                self.after(0, self.scan_status_var.set, "No DNS services discovered.")
+                self.after(0, self.scan_log.insert, tk.END, "No DNS services discovered.\n")
+                self.after(0, self.scan_found_var.set, "0")
+                self.after(0, self.scan_added_var.set, "0")
                 return
             custom = [DNSServer.from_dict(item) for item in self.config_obj["custom_dns"]]
             existing_ips = {server.primary for server in custom} | {server.primary for server in [DNSServer.from_dict(item) for item in self.config_obj["dns_servers"]]}
@@ -1387,24 +1599,35 @@ class DNSBenchmarkApp(tk.Tk):
             for host in found_hosts:
                 if host in existing_ips:
                     continue
-                new_server = DNSServer(f"discovered_{host.replace('.', '_')}_{int(time.time())}", f"Discovered DNS {host}", host, "", port)
-                custom.append(new_server)
-                discovered_servers.append(new_server)
-                existing_ips.add(host)
-            self.config_obj["custom_dns"] = [server.to_dict() for server in custom]
-            save_config(self.config_obj)
+                discovered_servers.append(host)
+            self.after(0, self.scan_found_var.set, str(len(found_hosts)))
+            self.after(0, self.scan_added_var.set, str(len(discovered_servers)))
+            self.after(0, self.scan_log.insert, tk.END, f"Discovered {len(found_hosts)} host(s); {len(discovered_servers)} new host(s) pending import.\n")
             self.after(0, lambda: self.on_scan_complete(len(found_hosts), len(discovered_servers)))
+            self.after(0, self.scan_hosts_list.delete, 0, tk.END)
+            for host in found_hosts:
+                self.after(0, self.scan_hosts_list.insert, tk.END, host)
             if discovered_servers:
                 timeout_ms = self.config_obj.get("timeout", 2000)
                 queries = self.config_obj.get("queries_per_domain", 10)
-                for server in discovered_servers:
-                    stats = loop.run_until_complete(run_speed_test(server, self.test_domains, timeout_ms / 1000.0, queries))
-                    self.benchmark_results[server.id] = stats
-                    self.after(0, self.update_row, server.id)
+                for host in discovered_servers:
+                    temp_server = DNSServer(f"discovered_{host.replace('.', '_')}_{int(time.time())}", f"Discovered DNS {host}", host, "", port)
+                    stats = loop.run_until_complete(run_speed_test(temp_server, self.test_domains, timeout_ms / 1000.0, queries))
+                    self.benchmark_results[temp_server.id] = stats
+                    self.after(0, self.update_row, temp_server.id)
+                    self.after(0, self.scan_log.insert, tk.END, f"Benchmarked discovered host {host}\n")
         except Exception as exc:
             self.after(0, lambda: messagebox.showerror("Scan DNS", str(exc), parent=self))
+            self.after(0, self.scan_status_var.set, "Scan failed.")
+            self.after(0, self.scan_log.insert, tk.END, f"Scan failed: {exc}\n")
         finally:
+            self.after(0, self.progress_bar.stop)
+            self.after(0, lambda: self.progress_bar.config(mode="determinate", value=0))
+            self.after(0, self.scan_progress_bar.stop)
+            self.after(0, lambda: self.scan_progress_bar.config(mode="determinate", value=0))
             self.after(0, lambda: self.set_status("Scan completed."))
+            self.after(0, self.scan_status_var.set, "Scan completed.")
+            self.after(0, self.scan_log.insert, tk.END, "Scan completed.\n")
 
     def on_scan_complete(self, found: int, added: int) -> None:
         self.all_servers = [DNSServer.from_dict(item) for item in self.config_obj["dns_servers"]] + [DNSServer.from_dict(item) for item in self.config_obj["custom_dns"]]
