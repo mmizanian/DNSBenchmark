@@ -282,6 +282,7 @@ async def scan_dns_targets(
     port: int,
     timeout: float,
     progress_callback: Optional[Any] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> List[str]:
     semaphore = asyncio.Semaphore(50)
     found: List[str] = []
@@ -290,13 +291,17 @@ async def scan_dns_targets(
 
     async def probe(host: str) -> None:
         nonlocal completed
+        if cancel_event is not None and cancel_event.is_set():
+            return
         async with semaphore:
+            if cancel_event is not None and cancel_event.is_set():
+                return
             if await probe_dns_host(host, port, timeout):
                 found.append(host)
             await asyncio.sleep(0.01)
         async with progress_lock:
             completed += 1
-            if progress_callback is not None:
+            if progress_callback is not None and not (cancel_event is not None and cancel_event.is_set()):
                 progress_callback(completed, len(hosts))
 
     tasks = [asyncio.create_task(probe(host)) for host in hosts]
@@ -741,6 +746,8 @@ class DNSBenchmarkApp(tk.Tk):
         self.benchmark_results: Dict[str, Dict[str, Any]] = {}
         self.benchmark_thread: Optional[threading.Thread] = None
         self.benchmark_cancel_event = threading.Event()
+        self.scan_thread: Optional[threading.Thread] = None
+        self.scan_cancel_event = threading.Event()
         self.discovered_scan_hosts: List[str] = []
         self.create_widgets()
         self.refresh_table()
@@ -933,7 +940,7 @@ class DNSBenchmarkApp(tk.Tk):
         ttk.Entry(preview_frame, textvariable=self.primary_var, width=24, state="readonly").grid(row=0, column=1, sticky=tk.W, padx=(8, 16))
         ttk.Label(preview_frame, text="Secondary:").grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
         ttk.Entry(preview_frame, textvariable=self.secondary_var, width=24, state="readonly").grid(row=1, column=1, sticky=tk.W, padx=(8, 16), pady=(6, 0))
-        ttk.Label(preview_frame, text="DNS Safe:").grid(row=2, column=0, sticky=tk.W, pady=(6, 0))
+        ttk.Label(preview_frame, text="Score:").grid(row=2, column=0, sticky=tk.W, pady=(6, 0))
         ttk.Entry(preview_frame, textvariable=self.safe_var, width=24, state="readonly").grid(row=2, column=1, sticky=tk.W, padx=(8, 16), pady=(6, 0))
 
         right_controls = ttk.Frame(controls_bottom)
@@ -966,6 +973,8 @@ class DNSBenchmarkApp(tk.Tk):
         self.scan_status_label.pack(anchor=tk.W, pady=(4, 12))
         self.scan_progress_bar = ttk.Progressbar(scanner_frame, maximum=100, mode="indeterminate")
         self.scan_progress_bar.pack(fill=tk.X, pady=(0, 12))
+        self.scan_stop_button = ttk.Button(scanner_frame, text="Stop Scan", command=self.cancel_scan, state="disabled")
+        self.scan_stop_button.pack(anchor=tk.W, pady=(0, 12))
 
         summary_frame = ttk.LabelFrame(scanner_frame, text="Scan Summary", padding=(10, 10))
         summary_frame.pack(fill=tk.X, pady=(0, 10))
@@ -1035,6 +1044,15 @@ class DNSBenchmarkApp(tk.Tk):
     def on_benchmark_cancelled(self) -> None:
         self.set_status("Benchmark cancelled.")
         self.start_test_button.config(text="Start DNS Test")
+
+    def cancel_scan(self) -> None:
+        if self.scan_thread and self.scan_thread.is_alive():
+            self.scan_cancel_event.set()
+            self.scan_status_var.set("Stopping scan...")
+            self.set_status("Stopping scan...")
+            self.scan_stop_button.config(state="disabled")
+            return
+        self.scan_stop_button.config(state="disabled")
 
     def update_adapter_list(self, default_to_all: bool = False) -> None:
         adapters = [adapter["name"] for adapter in get_network_adapters()]
@@ -1507,11 +1525,15 @@ class DNSBenchmarkApp(tk.Tk):
         self.set_status("Test domains updated.")
 
     def on_scan_dns(self) -> None:
+        if self.scan_thread and self.scan_thread.is_alive():
+            messagebox.showinfo("Scan DNS", "A scan is already running. Use Stop Scan to cancel it.", parent=self)
+            return
         dialog = ScanDNSDialog(self)
         result = dialog.show()
         if result is None:
             return
         target_spec, port = result
+        self.scan_cancel_event.clear()
         self.discovered_scan_hosts = []
         self.scan_log.delete("1.0", tk.END)
         self.scan_hosts_list.delete(0, tk.END)
@@ -1527,8 +1549,9 @@ class DNSBenchmarkApp(tk.Tk):
         self.progress_bar.start(15)
         self.scan_progress_bar.config(mode="indeterminate")
         self.scan_progress_bar.start(15)
-        scan_thread = threading.Thread(target=self.scan_worker, args=(target_spec, port), daemon=True)
-        scan_thread.start()
+        self.scan_stop_button.config(state="normal")
+        self.scan_thread = threading.Thread(target=self.scan_worker, args=(target_spec, port), daemon=True)
+        self.scan_thread.start()
 
     def on_add_discovered_dns(self) -> None:
         if not self.discovered_scan_hosts:
@@ -1564,6 +1587,8 @@ class DNSBenchmarkApp(tk.Tk):
             found_hosts: List[str] = []
 
             def update_progress(done: int, total: int) -> None:
+                if self.scan_cancel_event.is_set():
+                    return
                 self.after(0, self.scan_status_var.set, f"Scanning DNS hosts {done}/{total}...")
                 self.after(0, self.scan_log.insert, tk.END, f"Probed {done}/{total} hosts\n")
 
@@ -1573,8 +1598,14 @@ class DNSBenchmarkApp(tk.Tk):
                     port,
                     self.config_obj.get("timeout", 2) / 1000.0,
                     progress_callback=update_progress,
+                    cancel_event=self.scan_cancel_event,
                 )
             )
+            if self.scan_cancel_event.is_set():
+                self.after(0, self.scan_status_var.set, "Scan stopped.")
+                self.after(0, self.scan_log.insert, tk.END, "Scan was cancelled by the user.\n")
+                self.after(0, lambda: self.set_status("Scan stopped."))
+                return
             self.discovered_scan_hosts = found_hosts
             if not found_hosts:
                 self.after(0, lambda: messagebox.showwarning("Scan DNS", "No DNS services discovered.", parent=self))
@@ -1586,7 +1617,7 @@ class DNSBenchmarkApp(tk.Tk):
                 return
             custom = [DNSServer.from_dict(item) for item in self.config_obj["custom_dns"]]
             existing_ips = {server.primary for server in custom} | {server.primary for server in [DNSServer.from_dict(item) for item in self.config_obj["dns_servers"]]}
-            discovered_servers: List[DNSServer] = []
+            discovered_servers: List[str] = []
             for host in found_hosts:
                 if host in existing_ips:
                     continue
@@ -1602,10 +1633,11 @@ class DNSBenchmarkApp(tk.Tk):
                 timeout_ms = self.config_obj.get("timeout", 2000)
                 queries = self.config_obj.get("queries_per_domain", 10)
                 for host in discovered_servers:
+                    if self.scan_cancel_event.is_set():
+                        break
                     temp_server = DNSServer(f"discovered_{host.replace('.', '_')}_{int(time.time())}", f"Discovered DNS {host}", host, "", port)
                     stats = loop.run_until_complete(run_speed_test(temp_server, self.test_domains, timeout_ms / 1000.0, queries))
                     self.benchmark_results[temp_server.id] = stats
-                    self.after(0, self.update_row, temp_server.id)
                     self.after(0, self.scan_log.insert, tk.END, f"Benchmarked discovered host {host}\n")
         except Exception as exc:
             self.after(0, lambda: messagebox.showerror("Scan DNS", str(exc), parent=self))
@@ -1616,9 +1648,11 @@ class DNSBenchmarkApp(tk.Tk):
             self.after(0, lambda: self.progress_bar.config(mode="determinate", value=0))
             self.after(0, self.scan_progress_bar.stop)
             self.after(0, lambda: self.scan_progress_bar.config(mode="determinate", value=0))
-            self.after(0, lambda: self.set_status("Scan completed."))
-            self.after(0, self.scan_status_var.set, "Scan completed.")
-            self.after(0, self.scan_log.insert, tk.END, "Scan completed.\n")
+            self.after(0, self.scan_stop_button.config, state="disabled")
+            if not self.scan_cancel_event.is_set():
+                self.after(0, lambda: self.set_status("Scan completed."))
+                self.after(0, self.scan_status_var.set, "Scan completed.")
+                self.after(0, self.scan_log.insert, tk.END, "Scan completed.\n")
 
     def on_scan_complete(self, found: int, added: int) -> None:
         self.all_servers = [DNSServer.from_dict(item) for item in self.config_obj["dns_servers"]] + [DNSServer.from_dict(item) for item in self.config_obj["custom_dns"]]
