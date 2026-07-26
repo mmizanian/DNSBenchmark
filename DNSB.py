@@ -9,8 +9,10 @@ import ipaddress
 import json
 import random
 import re
+import socket
 import statistics
 import string
+import struct
 import subprocess
 import threading
 import time
@@ -18,18 +20,168 @@ import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import messagebox, ttk
-from typing import Any, Dict, List, Optional, Tuple
-
-import dns.asyncquery
-import dns.asyncresolver
-import dns.message
-import dns.resolver
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import ctypes
+
+try:
+    import dns.asyncquery
+    import dns.asyncresolver
+    import dns.message
+    import dns.resolver
+except Exception:  # pragma: no cover - optional dependency fallback
+    dns = None
+else:
+    dns = __import__("dns")
 
 CONFIG_PATH = Path("config.json")
 ALL_ADAPTERS_NAME = "All adapters"
 SCAN_MAX_HOSTS = 512
+
+
+def compute_dns_score(success_rate: float, avg_ms: float, std_dev_ms: float, hijacked: bool = False) -> float:
+    if hijacked:
+        return -9999.0
+    success_component = max(0.0, min(100.0, float(success_rate) * 0.7))
+    latency_component = max(0.0, 100.0 - min(float(avg_ms), 1000.0) / 10.0) * 0.2
+    stability_component = max(0.0, 100.0 - min(float(std_dev_ms), 1000.0) / 2.0) * 0.1
+    return round(max(0.0, min(100.0, success_component + latency_component + stability_component)), 2)
+
+
+def iter_scan_batches(hosts: List[str], batch_size: int = SCAN_MAX_HOSTS) -> Iterator[List[str]]:
+    for index in range(0, len(hosts), batch_size):
+        yield hosts[index:index + batch_size]
+
+
+def _build_dns_query(name: str, record_type: str = "A") -> bytes:
+    header_id = random.randint(0, 65535)
+    flags = 0x0100
+    qdcount = 1
+    header = struct.pack("!HHHHHH", header_id, flags, qdcount, 0, 0, 0)
+    labels = name.split(".")
+    question = b""
+    for label in labels:
+        question += bytes([len(label)]) + label.encode("ascii")
+    question += b"\x00"
+    if record_type == "A":
+        qtype = 1
+    elif record_type == "AAAA":
+        qtype = 28
+    else:
+        qtype = 1
+    question += struct.pack("!HH", qtype, 1)
+    return header + question
+
+
+def _read_dns_name(data: bytes, offset: int) -> Tuple[str, int]:
+    labels: List[str] = []
+    jumped = False
+    current_offset = offset
+    original_offset = offset
+    while True:
+        if current_offset >= len(data):
+            return ".".join(labels), offset
+        length = data[current_offset]
+        if length == 0:
+            return ".".join(labels), current_offset + 1
+        if length & 0xC0:
+            if current_offset + 1 >= len(data):
+                return ".".join(labels), offset
+            pointer = ((length & 0x3F) << 8) | data[current_offset + 1]
+            if not jumped:
+                original_offset = current_offset + 2
+            current_offset = pointer
+            jumped = True
+            continue
+        current_offset += 1
+        label = data[current_offset:current_offset + length].decode("ascii", errors="replace")
+        current_offset += length
+        labels.append(label)
+    return ".".join(labels), original_offset if jumped else current_offset
+
+
+def _parse_dns_response(data: bytes) -> Tuple[List[str], int, str]:
+    if len(data) < 12:
+        return [], 0, "ERROR"
+    qdcount = int.from_bytes(data[4:6], "big")
+    ancount = int.from_bytes(data[6:8], "big")
+    offset = 12
+    for _ in range(qdcount):
+        _, offset = _read_dns_name(data, offset)
+        offset += 4
+    ips: List[str] = []
+    ttl = 0
+    for _ in range(ancount):
+        _, offset = _read_dns_name(data, offset)
+        if offset + 10 > len(data):
+            return ips, ttl, "ERROR"
+        rtype = int.from_bytes(data[offset:offset + 2], "big")
+        offset += 2
+        _ = int.from_bytes(data[offset:offset + 2], "big")
+        offset += 2
+        ttl = int.from_bytes(data[offset:offset + 4], "big")
+        offset += 4
+        rdlength = int.from_bytes(data[offset:offset + 2], "big")
+        offset += 2
+        if offset + rdlength > len(data):
+            return ips, ttl, "ERROR"
+        rdata = data[offset:offset + rdlength]
+        offset += rdlength
+        if rtype == 1 and rdlength == 4:
+            ips.append(socket.inet_ntoa(rdata))
+    return ips, ttl, "NOERROR"
+
+
+def _query_dns_transport_sync(host: str, port: int, name: str, timeout: float) -> Tuple[bool, List[str], int, str]:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(_build_dns_query(name), (host, port))
+        data, _ = sock.recvfrom(4096)
+        ips, ttl, status = _parse_dns_response(data)
+        return True, ips, ttl, status
+    except (socket.timeout, OSError):
+        return False, [], 0, "TIMEOUT"
+    finally:
+        sock.close()
+
+
+class SimpleResolver:
+    def __init__(self, nameserver: str, port: int = 53) -> None:
+        self.nameserver = nameserver
+        self.port = port
+
+    async def resolve(self, name: str, rdtype: str = "A", lifetime: Optional[float] = None) -> Any:
+        loop = asyncio.get_running_loop()
+        success, ips, ttl, status = await loop.run_in_executor(None, _query_dns_transport_sync, self.nameserver, self.port, name, lifetime or 2.0)
+        if not success:
+            raise RuntimeError(status)
+        return _SimpleAnswer(ips, ttl)
+
+
+class _SimpleRRSet:
+    def __init__(self, ttl: int, addresses: List[str]) -> None:
+        self.ttl = ttl
+        self._addresses = addresses
+
+    def __len__(self) -> int:
+        return len(self._addresses)
+
+    def __iter__(self):
+        return iter([type("_SimpleRData", (), {"address": address})() for address in self._addresses])
+
+
+class _SimpleAnswer:
+    def __init__(self, addresses: List[str], ttl: int) -> None:
+        self.rrset = _SimpleRRSet(ttl, addresses)
+        self._addresses = addresses
+
+    def __iter__(self):
+        return iter([type("_SimpleRData", (), {"address": address})() for address in self._addresses])
+
+
+class _SimpleResolverError(RuntimeError):
+    pass
 
 
 @dataclass
@@ -263,18 +415,20 @@ def parse_scan_targets(spec: str) -> List[str]:
             hosts.extend(str(ipaddress.IPv4Address(int(start) + i)) for i in range(int(end) - int(start) + 1))
         else:
             hosts.append(str(ipaddress.IPv4Address(item)))
-        if len(hosts) > SCAN_MAX_HOSTS:
-            raise ValueError(f"Scan target too large ({len(hosts)}) hosts; limit is {SCAN_MAX_HOSTS}")
     return hosts
 
 
 async def probe_dns_host(host: str, port: int, timeout: float) -> bool:
-    query = dns.message.make_query("example.com", dns.rdatatype.A)
-    try:
-        response = await dns.asyncquery.udp(query, host, port=port, timeout=timeout)
-        return response is not None
-    except Exception:
-        return False
+    if dns is not None:
+        query = dns.message.make_query("example.com", dns.rdatatype.A)
+        try:
+            response = await dns.asyncquery.udp(query, host, port=port, timeout=timeout)
+            return response is not None
+        except Exception:
+            return False
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, _query_dns_transport_sync, host, port, "example.com", timeout)
+    return bool(result[0])
 
 
 async def scan_dns_targets(
@@ -283,6 +437,7 @@ async def scan_dns_targets(
     timeout: float,
     progress_callback: Optional[Any] = None,
     cancel_event: Optional[threading.Event] = None,
+    batch_size: int = SCAN_MAX_HOSTS,
 ) -> List[str]:
     semaphore = asyncio.Semaphore(50)
     found: List[str] = []
@@ -304,8 +459,11 @@ async def scan_dns_targets(
             if progress_callback is not None and not (cancel_event is not None and cancel_event.is_set()):
                 progress_callback(completed, len(hosts))
 
-    tasks = [asyncio.create_task(probe(host)) for host in hosts]
-    await asyncio.gather(*tasks)
+    for batch in iter_scan_batches(hosts, batch_size=batch_size):
+        if cancel_event is not None and cancel_event.is_set():
+            break
+        tasks = [asyncio.create_task(probe(host)) for host in batch]
+        await asyncio.gather(*tasks)
     return found
 
 
@@ -335,18 +493,15 @@ def set_dhcp(adapter_name: str) -> Tuple[bool, str]:
         return False, exc.stderr.strip() if exc.stderr else str(exc)
 
 
-async def single_query(resolver: dns.asyncresolver.Resolver, domain: str, timeout: float) -> Tuple[bool, float]:
+async def single_query(resolver: Any, domain: str, timeout: float) -> Tuple[bool, float]:
     start = time.monotonic()
     try:
         answer = await resolver.resolve(domain, "A", lifetime=timeout)
         elapsed = time.monotonic() - start
-        if answer.rrset and len(answer.rrset) > 0:
+        rrset = getattr(answer, "rrset", None)
+        if rrset is not None and getattr(rrset, "ttl", None) is not None:
             return True, elapsed
         return False, elapsed
-    except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.NoNameservers):
-        return False, time.monotonic() - start
-    except dns.resolver.LifetimeTimeout:
-        return False, timeout
     except Exception:
         return False, time.monotonic() - start
 
@@ -356,18 +511,12 @@ def make_random_subdomain(domain: str, length: int = 10) -> str:
     return f"{token}.{domain}"
 
 
-async def query_a_records(resolver: dns.asyncresolver.Resolver, name: str, timeout: float) -> Tuple[bool, List[str], int, str]:
+async def query_a_records(resolver: Any, name: str, timeout: float) -> Tuple[bool, List[str], int, str]:
     try:
         answer = await resolver.resolve(name, "A", lifetime=timeout)
         ips = [rdata.address for rdata in answer]
-        ttl = answer.rrset.ttl if answer.rrset else 0
+        ttl = answer.rrset.ttl if getattr(answer, "rrset", None) else 0
         return True, ips, ttl, "NOERROR"
-    except dns.resolver.NXDOMAIN:
-        return False, [], 0, "NXDOMAIN"
-    except dns.resolver.NoAnswer:
-        return False, [], 0, "NOANSWER"
-    except dns.resolver.LifetimeTimeout:
-        return False, [], 0, "TIMEOUT"
     except Exception:
         return False, [], 0, "ERROR"
 
@@ -382,9 +531,10 @@ async def run_speed_test(
     cancel_event: Optional[threading.Event] = None,
 ) -> Dict[str, Any]:
     async def benchmark_address(address: str) -> Dict[str, Any]:
-        resolver = dns.asyncresolver.Resolver()
-        resolver.nameservers = [address]
-        resolver.port = server.port
+        resolver = SimpleResolver(address, server.port) if dns is None else dns.asyncresolver.Resolver()
+        if dns is not None:
+            resolver.nameservers = [address]
+            resolver.port = server.port
         success_times: List[float] = []
         total = len(domains) * queries_per_domain
         query_timeout = timeout
@@ -434,12 +584,8 @@ async def run_speed_test(
         test_domain = f"nxdomain-check-{random.randint(100000,999999)}.example.com"
         try:
             answer = await resolver.resolve(test_domain, "A", lifetime=timeout)
-            if answer.rrset and len(answer.rrset) > 0:
+            if getattr(answer, "rrset", None) is not None and len(answer.rrset) > 0:
                 hijacked = True
-        except dns.resolver.NXDOMAIN:
-            hijacked = False
-        except (dns.resolver.NoAnswer, dns.resolver.NoNameservers, dns.resolver.LifetimeTimeout):
-            hijacked = False
         except Exception:
             hijacked = False
 
@@ -463,7 +609,7 @@ async def run_speed_test(
             stats["hijack_ips"] = suspect_ips
 
         stats["hijacked"] = hijacked
-        stats["score"] = round(-9999.0 if hijacked else (stats["success_rate"] * 10.0 - stats["avg_ms"] * 0.2 - stats["std_dev_ms"] * 0.1), 2)
+        stats["score"] = compute_dns_score(stats["success_rate"], stats["avg_ms"], stats["std_dev_ms"], hijacked=hijacked)
         return stats
 
     primary_stats = await benchmark_address(server.primary)
@@ -500,11 +646,11 @@ async def run_speed_test(
         "primary": primary_stats,
         "secondary": secondary_stats,
         "hijacked": primary_stats.get("hijacked", False) or secondary_stats.get("hijacked", False),
-        "score": round(
-            -9999.0
-            if (primary_stats.get("hijacked", False) or secondary_stats.get("hijacked", False))
-            else (combined_success_rate * 10.0 - combined_avg * 0.2 - combined_std * 0.1),
-            2,
+        "score": compute_dns_score(
+            combined_success_rate,
+            combined_avg,
+            combined_std,
+            hijacked=primary_stats.get("hijacked", False) or secondary_stats.get("hijacked", False),
         ),
     }
     if primary_stats.get("hijack_reason"):
@@ -1207,23 +1353,20 @@ class DNSBenchmarkApp(tk.Tk):
             score = float(res.get("score", 0.0))
         except (TypeError, ValueError):
             score = 0.0
-        if score >= 80:
-            return "Strong"
-        if score >= 45:
-            return "Good"
-        if score >= 10:
-            return "Fair"
-        return "Avoid"
+        return f"{score:.1f}"
 
     def get_row_tags(self, res: Dict[str, Any]) -> List[str]:
         tags: List[str] = []
         if res.get("hijacked"):
             tags.append("hijacked")
         else:
-            score_label = self.get_score_label(res)
-            if score_label in {"Strong", "Good"}:
+            try:
+                score = float(res.get("score", 0.0))
+            except (TypeError, ValueError):
+                score = 0.0
+            if score >= 80.0:
                 tags.append("fast")
-            elif score_label == "Avoid":
+            elif score <= 20.0:
                 tags.append("error")
         return tags
 
